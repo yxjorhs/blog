@@ -16,22 +16,40 @@ rdb是快照方式，保存server某一个时间点的数据，复原则利用�
 
 在客户端中执行bgsave命令主动生成快照
 
-bgsave指令执行顺序如下
+```shell
+127.0.0.1:6379> bgsave
+Background saving started
+```
 
-* bgsaveCommand
-  * 判断当前是否正在执行rdb、aof等操作，是则响应对应的错误
-* rdbSaveBackground
-  * fork()
-    * 子进程，负责生成rdb文件
-      * **rdbSaveRio** 将数据保存到临时文件
-        * rdbSaveInfoAuxFields 保存redis-version、占用内存等信息
-        * rdbSaveModulesAux 保存module数据
-        * 遍历各个db，保存数据
-        * 保存lua脚本
-      * 将临时文件名称修改为server.rdb_filename所配置的文件名
-      * 更新完毕后通过write()将相关信息写入server.child_info_pipe(保存子进程信息的管道)
-      * 关闭子进程
-    * 主进程，更新server中与rdb生成状态有关的字段
+
+
+**那么bgsave是怎么执行的**
+
+* **bgsaveCommand**
+  * 当前正在生成rdb、aof，则报错返回
+
+  * **rdbPopulateSaveInfo** 获取执行rdb的实例是master还是slave的信息
+
+  * **rdbSaveBackground**
+
+    * **openChildInfoPipe** 
+
+      创建管道，方便后面的父子进程间通信
+
+    * **fork()**
+
+      * 子进程
+        * **closeClildUnusedResourceAfterFork** 子进程复制了父进程所有资源，这里关闭子进程不需要的资源
+        * **redisSetProcTitle**
+        * **rdbSaveRio** 将数据保存到临时文件
+          * rdbSaveInfoAuxFields 保存redis-version、占用内存等信息
+          * rdbSaveModulesAux 保存module数据
+          * 遍历各个db，保存数据
+          * 保存lua脚本
+        * 将临时文件名称修改为server.rdb_filename所配置的文件名
+        * 更新完毕后通过write()将相关信息写入server.child_info_pipe(保存子进程信息的管道)
+        * 关闭子进程
+      * 主进程，更新server中与rdb生成状态有关的字段
 
 ### 被动触发
 
@@ -72,18 +90,19 @@ fsync是个阻塞且缓慢的操作，因此提供了3种策略选择
 
 
 
-**将aof写入server.aof_buf代码路径如下**
+**将aof写入server.aof_buf代码路径如下
 
-1. beforeSleep
-2. processUnblockedClients 查找可以执行的客户端
-3. processInputBufferAndReplicate
-4. processInputBuffer
-5. processCommand 执行对应的指令
-6. call
-7. propagate
-   * 通过server.aof_state != AOF_OFF判断是否开启了AOF
-8. **feedAppendOnlyFile**
-   * 将指令写入server.aof_buf
+* **processCommand** 执行对应的指令
+
+  * call
+
+    * propagate
+
+      * server.aof_state != AOF_OFF // 判断是否开启了AOF
+
+        * 是则执行**feedAppendOnlyFile**
+
+          将指令写入server.aof_buf
 
 
 
@@ -175,12 +194,14 @@ auto-aof-rewrite-min-size 64mb
 
 当aof文件超过64mb，且比基准大小大了100%时触发aof重写
 
+基准为上次执行aof产生的aof文件大小
+
 
 
 被动触发依赖redis的定时任务实现
 
-* serverCron
-  * 开启aof & 当前没有执行rdb & 当前没有执行aof & aof_rewrite_perc & 当前aof大小大于重写最小大小
+* **serverCron**
+  * 开启aof & 当前没有执行rdb & 当前没有执行aof & aof_rewrite_perc & 当前aof文件超过auto-aof-rewrite-min-size
   * **rewriteAppendOnlyFileBackground** 
 
 
