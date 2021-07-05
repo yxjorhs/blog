@@ -1,204 +1,59 @@
 # redis如何执行lua脚本
 
-顺着路径
+## 什么是lua脚本
 
-server.c->redisCommandTable->evalCommand->evalGenericCommand
-
-找到evalGenericCommand，eval指令的对应函数，其入参如下
-
-```c
-void evalGenericCommand(client *c, int evalsha) {
-```
-
-c即为发送lua脚本的客户端
-
-**evalsha是个整数类型，取值有0与1，它有什么作用?**
-
-redis可以通过eval与evalSha执行lua脚本
-
-区别在于eval输入整个脚本以及参数
-
-evalsha只需要输入脚本的校验码以及参数，相对eval，可以节省带宽
-
-因此evalsha起到一个告知函数是eval命令还是evalSha命令的作用
+就是在redis里面执行lua代码
 
 
 
-redis每次只能执行一次lua脚本，很多状态都保存在server实例中，执行脚本需要对这些状态进行初始化
+**eval**命令，直接执行lua脚本
 
-```c
-server.lua_random_dirty = 0;
-server.lua_write_dirty = 0;
-server.lua_replicate_commands = server.lua_always_replicate_commands;
-server.lua_multi_emitted = 0;
-server.lua_repl = PROPAGATE_AOF|PROPAGATE_REPL;
+```shell
+127.0.0.1:6379> eval "return redis.call('get', KEYS[1])" 1 a
+"1"
 ```
 
 
 
-判断下命令的参数个数是否正确
+但当脚本很长的时候，每次都传脚本过去显然很耗带宽，于是还有个**evalsha**命令，先用script(脚本管理的命令) load命令将脚本保存的服务端，返回一个脚本sha1校验和
 
-```c
-if (getLongLongFromObjectOrReply(c,c->argv[2],&numkeys,NULL) != C_OK)
-    return;
-if (numkeys > (c->argc - 3)) {
-    addReplyError(c,"Number of keys can't be greater than number of args");
-    return;
-} else if (numkeys < 0) {
-        addReplyError(c,"Number of keys can't be negative");
-    return;
-}
+evalsha命令带上sha1校验和以及入参即可执行lua脚本
+
+```shell
+127.0.0.1:6379> script load "return redis.call('get', KEYS[1])"
+"4e6d8fc8bb01276962cce5371fa795a7763657ae"
+127.0.0.1:6379> evalsha 4e6d8fc8bb01276962cce5371fa795a7763657ae 1 a
+"1"
 ```
 
 
 
-获取校验码，eval需要根据输入的指令计算，evalsha1直接从参数中获取
+## eval与evalsha是怎么执行的
 
-```c
-if (!evalsha) {
-    /* Hash the code if this is an EVAL call */
-    sha1hex(funcname+2,c->argv[1]->ptr,sdslen(c->argv[1]->ptr));
-} else {
-    /* We already have the SHA if it is a EVALSHA */
-    int j;
-    char *sha = c->argv[1]->ptr;
+eval命令的入口为evalCommand
 
-    /* Convert to lowercase. We don't use tolower since the function
-         * managed to always show up in the profiler output consuming
-         * a non trivial amount of time. */
-    for (j = 0; j < 40; j++)
-        funcname[j+2] = (sha[j] >= 'A' && sha[j] <= 'Z') ?
-        sha[j]+('a'-'A') : sha[j];
-    funcname[42] = '\0';
-}
-```
+* **evalCommand**
 
+  * **evalGenericCommand(client *c, int evalsha)**
 
+    这里有个evalsha参数，1代表执行evalsha命令，0代表执行eval命令
 
-根据校验码从全局查找脚本解析后的缓存，evalsha找不到缓存则返回，eval找不到缓存则解析脚本并创建缓存，因此不管是eval还是evalSha都有缓存脚本的功能
-
-lua是一个指针，指向server.lua，全局的lua脚本解析器，所有lua指令共用，因此一次只能执行一个lua脚本
-
-```c
-lua_getglobal(lua, funcname);
-if (lua_isnil(lua,-1)) {
-    lua_pop(lua,1); /* remove the nil from the stack */
-    /* Function not defined... let's define it if we have the
-         * body of the function. If this is an EVALSHA call we can just
-         * return an error. */
-    if (evalsha) {
-        lua_pop(lua,1); /* remove the error handler from the stack. */
-        addReply(c, shared.noscripterr);
-        return;
-    }
-    if (luaCreateFunction(c,lua,c->argv[1]) == NULL) {
-        lua_pop(lua,1); /* remove the error handler from the stack. */
-        /* The error is sent to the client by luaCreateFunction()
-             * itself when it returns NULL. */
-        return;
-    }
-    /* Now the following is guaranteed to return non nil */
-    lua_getglobal(lua, funcname);
-    serverAssert(!lua_isnil(lua,-1));
-}
-```
-
-给lua解析器传入key和参数
-
-```c
-luaSetGlobalArray(lua,"KEYS",c->argv+3,numkeys);
-luaSetGlobalArray(lua,"ARGV",c->argv+3+numkeys,c->argc-3-numkeys);
-```
-
-server.lua_client为虚拟的执行lua脚本client，设置其db为实际client的db
-
-```c
-selectDb(server.lua_client,c->db->id);
-```
-
-给lua脚本解析设置hook，超时则停止脚本解析，debug状态下则每解析一行则触发一次回调
-
-```c
- /* Set a hook in order to be able to stop the script execution if it
-     * is running for too much time.
-     * We set the hook only if the time limit is enabled as the hook will
-     * make the Lua script execution slower.
-     *
-     * If we are debugging, we set instead a "line" hook so that the
-     * debugger is call-back at every line executed by the script. */
-server.lua_caller = c;
-server.lua_time_start = mstime();
-server.lua_kill = 0;
-if (server.lua_time_limit > 0 && ldb.active == 0) {
-    lua_sethook(lua,luaMaskCountHook,LUA_MASKCOUNT,100000);
-    delhook = 1;
-} else if (ldb.active) {
-    lua_sethook(server.lua,luaLdbLineHook,LUA_MASKLINE|LUA_MASKCOUNT,100000);
-    delhook = 1;
-}
-```
-
-执行脚本
-
-```c
-err = lua_pcall(lua,0,1,-2);
-```
-
-
-
-不管是否执行完毕，清空hook；超时则将client由保护态释放，在下一个安全时间尝试再次执行
-
-```c
-/* Perform some cleanup that we need to do both on error and success. */
-if (delhook) lua_sethook(lua,NULL,0,0); /* Disable hook */
-if (server.lua_timedout) {
-    server.lua_timedout = 0;
-    /* Restore the client that was protected when the script timeout
-         * was detected. */
-    unprotectClient(c);
-    if (server.masterhost && server.master)
-        queueClientForReprocessing(server.master);
-}
-server.lua_caller = NULL;
-```
-
-
-
-每执行50次lua脚本就会进行垃圾回收
-
-```c
-/* Call the Lua garbage collector from time to time to avoid a
-     * full cycle performed by Lua, which adds too latency.
-     *
-     * The call is performed every LUA_GC_CYCLE_PERIOD executed commands
-     * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
-     * for every command uses too much CPU. */
-#define LUA_GC_CYCLE_PERIOD 50
-{
-    static long gc_count = 0;
-
-    gc_count++;
-    if (gc_count == LUA_GC_CYCLE_PERIOD) {
-        lua_gc(lua,LUA_GCSTEP,LUA_GC_CYCLE_PERIOD);
-        gc_count = 0;
-    }
-}
-```
-
-
-
-向客户端返回执行结果
-
-```c
-if (err) {
-    addReplyErrorFormat(c,"Error running script (call to %s): %s\n",
-                        funcname, lua_tostring(lua,-1));
-    lua_pop(lua,2); /* Consume the Lua reply and remove error handler. */
-} else {
-    /* On success convert the Lua return value into Redis protocol, and
-         * send it to * the client. */
-    luaReplyToRedisReply(c,lua); /* Convert and consume the reply. */
-    lua_pop(lua,1); /* Remove the error handler. */
-}
-```
+    * 初始化上次脚本执行后的状态
+    * 命令参数校验
+    * 使用eval则根据脚本生成一个sha1校验和
+    * 使用evalsha则将sha1校验和转小写
+    * 将sha1校验和放入server.lua中，server.lua是所有client共享的唯一的lua脚本解释器，可以根据sha1校验和查找对应的脚本(lua脚本的保存结构为哈希表+链表)
+    * 如果lua脚本解释器没找到sha1校验和对应的脚本
+      * evalsha1返回没找到脚本
+      * eval创建脚本
+    * 将参数传入lua脚本解释器
+    * 将sever.lua_client的db参数与为发起lua脚本的client同步，lua_client为执行lua脚本的模拟客户端
+    * 给lua脚本解析器设置监听器，添加超时回调，debug状态下添加行解析回调(解析一行脚本触发一次)
+    * **lua_pcall** 执行lua脚本
+    * 清空回调
+    * 如果超时且是主服务器的话，将脚本放到非阻塞client链表的尾部，在下一个循环处理
+    * 每执行50次lua脚本就会进行垃圾回收
+    * 向客户端返回lua执行结果
+    * 如果使用的是单命令复制、且lua脚本存在一个写操作，则发送exec给aof文件和从服务器
+    * 假设使用evalsha，且sha1没有发送给从服务器(使用字典记录了sha1有没有发送给从服务器)，会被转为完成的eval命令发送给从服务器以及aof文件
 
