@@ -8,11 +8,11 @@
 
 [redis如何实现hyperloglog](./redis如何实现hyperloglog.md)
 
-[redis如何实现主从复制](./redis如何实现主从复制.md)
-
 [redis如何实现发布订阅模式](./redis如何实现发布订阅模式.md)
 
 [redis如何实现持久化](./redis如何实现持久化.md)
 
 [redis如何执行lua脚本](./redis如何执行lua脚本.md)
+
+[redis的主从复制、哨兵、集群](./redis的主从复制、哨兵、集群.md)
 
